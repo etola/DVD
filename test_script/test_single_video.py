@@ -12,6 +12,7 @@ from safetensors.torch import load_file
 from tqdm import tqdm
 
 from diffsynth import save_video
+from diffsynth.util.alignment import disparity2depth
 from examples.wanvideo.model_training.WanTrainingModule import \
     WanTrainingModule
 
@@ -212,12 +213,27 @@ def _camera_for_image(reconstruction, image):
 
 
 def _depth_hw_z(depth_frame):
-    """(H, W) or (H, W, C) -> single-channel Z map (H, W)."""
+    """(H, W) or (H, W, C) -> single-channel map (H, W), float64."""
     if depth_frame.ndim == 2:
         return depth_frame.astype(np.float64, copy=False)
     if depth_frame.ndim == 3:
         return np.mean(depth_frame, axis=-1).astype(np.float64, copy=False)
     raise ValueError(f"Unexpected depth shape {depth_frame.shape}")
+
+
+def _to_perpendicular_z(depth_hw, depth_space):
+    """Map network output to perpendicular camera-frame Z for pinhole unprojection.
+
+    Training/validation treats the decoder output as *disparity* (same space as
+    ``depth2disparity(gt_depth)`` = 1/Z), then uses ``disparity2depth`` for metrics.
+    Using that signal directly as Z bends the cloud and breaks multi-view alignment.
+    """
+    if depth_space == "z":
+        return depth_hw
+    if depth_space == "disparity":
+        disp = np.maximum(depth_hw, 1e-6)
+        return disparity2depth(disp)
+    raise ValueError(f"Unknown depth_space: {depth_space!r}")
 
 
 def depth_to_world_points(depth_hw, camera, world_from_cam, stride=1):
@@ -273,7 +289,12 @@ def _safe_stem_from_image_name(name):
 
 
 def save_colmap_depth_point_clouds(
-    depth, reconstruction, frame_matches, output_dir, pts_stride=1,
+    depth,
+    reconstruction,
+    frame_matches,
+    output_dir,
+    pts_stride=1,
+    depth_space="disparity",
 ):
     """Save one PLY per matched frame under output_dir/pts/."""
     pts_dir = os.path.join(output_dir, "pts")
@@ -283,6 +304,7 @@ def save_colmap_depth_point_clouds(
     for t, image in frame_matches:
         cam = _camera_for_image(reconstruction, image)
         depth_hw = _depth_hw_z(depth[t])
+        depth_hw = _to_perpendicular_z(depth_hw, depth_space)
         orig_h, orig_w = depth_hw.shape
         cam.rescale(orig_w, orig_h)
 
@@ -319,12 +341,17 @@ def run_colmap_point_export(args, depth, frame_keys):
         f"COLMAP: {len(matches)} / {T} frames matched "
         f"(model from {sparse_path})."
     )
+    print(
+        f"COLMAP unprojection: treating network output as {args.colmap_depth_space!r} "
+        "(use --colmap_depth_space z if your checkpoint decodes metric Z)."
+    )
     save_colmap_depth_point_clouds(
         depth,
         reconstruction,
         matches,
         args.output_dir,
         pts_stride=args.pts_stride,
+        depth_space=args.colmap_depth_space,
     )
 
 
@@ -579,6 +606,14 @@ def parse_args():
         type=int,
         default=1,
         help="Pixel stride when sampling depth for COLMAP point clouds (larger = fewer points).",
+    )
+    parser.add_argument(
+        "--colmap_depth_space",
+        type=str,
+        choices=("disparity", "z"),
+        default="disparity",
+        help="Network output semantics before unprojection: 'disparity' (1/Z space, DVD/Wan "
+        "validation default) or 'z' (already perpendicular depth in camera frame).",
     )
     return parser.parse_args()
 
