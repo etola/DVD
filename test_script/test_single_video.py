@@ -67,6 +67,41 @@ def read_video(video_path):
     return video_tensor.unsqueeze(0), fps   # [1, T, C, H, W], fps
 
 
+_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
+
+
+def _list_image_paths(folder_path):
+    """Sorted list of image file paths under folder_path (non-recursive)."""
+    paths = []
+    for name in sorted(os.listdir(folder_path)):
+        ext = os.path.splitext(name)[1].lower()
+        if ext in _IMAGE_EXTENSIONS:
+            paths.append(os.path.join(folder_path, name))
+    return paths
+
+
+def read_image_sequence(folder_path, fps):
+    """Loads RGB frames from a directory; same tensor layout as read_video."""
+    image_paths = _list_image_paths(folder_path)
+    if not image_paths:
+        raise ValueError(
+            f"No supported images in {folder_path} "
+            f"(extensions: {sorted(_IMAGE_EXTENSIONS)})")
+
+    frames = []
+    for p in image_paths:
+        frame = cv2.imread(p, cv2.IMREAD_COLOR)
+        if frame is None:
+            raise ValueError(f"Cannot read image: {p}")
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frames.append(frame)
+
+    video_np = np.stack(frames)
+    video_tensor = torch.from_numpy(
+        video_np).permute(0, 3, 1, 2).float() / 255.0
+    return video_tensor.unsqueeze(0), float(fps)
+
+
 def resize_for_training_scale(video_tensor, target_h=480, target_w=640):
     B, T, C, H, W = video_tensor.shape
     ratio = max(target_h / H, target_w / W)
@@ -259,8 +294,13 @@ def load_model(ckpt_dir, yaml_args):
 
 
 def load_video_data(args):
-    """Loads and resizes the input video."""
-    input_tensor, origin_fps = read_video(args.input_video)
+    """Loads and resizes the input video or an image sequence from a folder."""
+    if os.path.isdir(args.input_video):
+        input_tensor, origin_fps = read_image_sequence(
+            args.input_video, args.sequence_fps)
+        print(f"Loaded {input_tensor.shape[1]} frames from image sequence")
+    else:
+        input_tensor, origin_fps = read_video(args.input_video)
     print("Original shape:", input_tensor.shape)
 
     input_tensor, orig_size = resize_for_training_scale(
@@ -287,7 +327,11 @@ def predict_depth(model, input_tensor, orig_size, args):
 def save_results(depth, origin_fps, args):
     """Normalizes and saves the depth video to disk."""
     os.makedirs(args.output_dir, exist_ok=True)
-    base_name = os.path.basename(args.input_video).split('.')[0]
+    in_path = args.input_video
+    if os.path.isdir(in_path):
+        base_name = os.path.basename(os.path.normpath(in_path))
+    else:
+        base_name = os.path.splitext(os.path.basename(in_path))[0]
     gray_scale = 'gray' if args.grayscale else 'color'
     out_prefix = os.path.join(
         args.output_dir, f"{base_name}_{gray_scale}")
@@ -305,7 +349,18 @@ def save_results(depth, origin_fps, args):
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt", type=str, required=True)
-    parser.add_argument("--input_video", type=str, required=True)
+    parser.add_argument(
+        "--input_video",
+        type=str,
+        required=True,
+        help="Path to a video file, or a directory of images (sorted by filename).",
+    )
+    parser.add_argument(
+        "--sequence_fps",
+        type=float,
+        default=24.0,
+        help="Output video FPS when --input_video is a folder of images.",
+    )
     parser.add_argument("--output_dir", type=str,
                         default="./inference_results")
     parser.add_argument('--model_config', default='ckpt/model_config.yaml')
