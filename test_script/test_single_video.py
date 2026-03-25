@@ -1,9 +1,9 @@
 import argparse
 import os
-from datetime import datetime
 
 import cv2
 import numpy as np
+import natsort
 import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
@@ -64,7 +64,8 @@ def read_video(video_path):
     video_tensor = torch.from_numpy(
         video_np).permute(0, 3, 1, 2).float() / 255.0
 
-    return video_tensor.unsqueeze(0), fps   # [1, T, C, H, W], fps
+    # No per-file names; COLMAP alignment uses sorted image order (see match_colmap_images).
+    return video_tensor.unsqueeze(0), fps, None
 
 
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
@@ -81,13 +82,20 @@ def _list_image_paths(folder_path):
 
 
 def read_image_sequence(folder_path, fps):
-    """Loads RGB frames from a directory; same tensor layout as read_video."""
+    """Loads RGB frames from a directory; same tensor layout as read_video.
+
+    Returns:
+        video_tensor: [1, T, C, H, W]
+        fps: float
+        frame_keys: list[str] of basenames (for COLMAP name matching)
+    """
     image_paths = _list_image_paths(folder_path)
     if not image_paths:
         raise ValueError(
             f"No supported images in {folder_path} "
             f"(extensions: {sorted(_IMAGE_EXTENSIONS)})")
 
+    frame_keys = [os.path.basename(p) for p in image_paths]
     frames = []
     for p in image_paths:
         frame = cv2.imread(p, cv2.IMREAD_COLOR)
@@ -99,7 +107,7 @@ def read_image_sequence(folder_path, fps):
     video_np = np.stack(frames)
     video_tensor = torch.from_numpy(
         video_np).permute(0, 3, 1, 2).float() / 255.0
-    return video_tensor.unsqueeze(0), float(fps)
+    return video_tensor.unsqueeze(0), float(fps), frame_keys
 
 
 def resize_for_training_scale(video_tensor, target_h=480, target_w=640):
@@ -128,6 +136,196 @@ def resize_depth_back(depth_np, orig_size):
     depth_tensor = F.interpolate(depth_tensor, size=(
         orig_H, orig_W), mode='bilinear', align_corners=False)
     return depth_tensor.permute(0, 2, 3, 1).cpu().numpy()
+
+
+# =============================
+# COLMAP: calibration & point clouds
+# =============================
+def _resolve_colmap_sparse_path(colmap_root):
+    """Return directory containing cameras.bin/txt (sparse model root)."""
+    root = os.path.abspath(colmap_root)
+    candidates = [
+        root,
+        os.path.join(root, "sparse", "0"),
+        os.path.join(root, "0"),
+    ]
+    for c in candidates:
+        if os.path.isdir(c) and (
+            os.path.isfile(os.path.join(c, "cameras.bin"))
+            or os.path.isfile(os.path.join(c, "cameras.txt"))
+        ):
+            return c
+    raise FileNotFoundError(
+        f"No COLMAP sparse model (cameras.bin/txt) under {colmap_root!r}; "
+        "tried the path itself and sparse/0."
+    )
+
+
+def _colmap_image_lookup(reconstruction):
+    """basename(lower) -> first Image (COLMAP names may include subdirs)."""
+    by_base = {}
+    by_lower = {}
+    for im in reconstruction.images.values():
+        b = os.path.basename(im.name)
+        by_base.setdefault(b, im)
+        by_lower.setdefault(b.lower(), im)
+    return by_base, by_lower
+
+
+def match_colmap_images(reconstruction, num_frames, frame_keys):
+    """List of (frame_index, pycolmap.Image) for frames present in COLMAP.
+
+    If frame_keys is a list of basenames, match by name (exact, then case-fold).
+    If frame_keys is None (video input), match by natsorted COLMAP image order
+    aligned to frame index (same length required).
+    """
+    images = list(reconstruction.images.values())
+    if not images:
+        raise ValueError("COLMAP reconstruction has no registered images.")
+
+    if frame_keys is not None:
+        by_base, by_lower = _colmap_image_lookup(reconstruction)
+        pairs = []
+        for t in range(num_frames):
+            k = frame_keys[t]
+            im = by_base.get(k) or by_lower.get(k.lower())
+            if im is not None:
+                pairs.append((t, im))
+        return pairs
+
+    sorted_imgs = natsort.natsorted(images, key=lambda im: im.name)
+    if len(sorted_imgs) != num_frames:
+        print(
+            f"Warning: COLMAP has {len(sorted_imgs)} images but input has "
+            f"{num_frames} frames; aligning first {min(len(sorted_imgs), num_frames)} "
+            "by sorted image name (video mode)."
+        )
+    n = min(len(sorted_imgs), num_frames)
+    return [(t, sorted_imgs[t]) for t in range(n)]
+
+
+def _camera_for_image(reconstruction, image):
+    import pycolmap
+
+    cam = reconstruction.cameras[image.camera_id]
+    return pycolmap.Camera(**cam.todict())
+
+
+def _depth_hw_z(depth_frame):
+    """(H, W) or (H, W, C) -> single-channel Z map (H, W)."""
+    if depth_frame.ndim == 2:
+        return depth_frame.astype(np.float64, copy=False)
+    if depth_frame.ndim == 3:
+        return np.mean(depth_frame, axis=-1).astype(np.float64, copy=False)
+    raise ValueError(f"Unexpected depth shape {depth_frame.shape}")
+
+
+def depth_to_world_points(depth_hw, camera, world_from_cam, stride=1):
+    """Unproject depth to 3D points in world frame (COLMAP convention).
+
+    depth_hw: metric/relative Z in camera coordinates (along optical axis),
+    same resolution as camera after rescale.
+    """
+    H, W = depth_hw.shape
+    if camera.width != W or camera.height != H:
+        raise ValueError(
+            f"Camera size {camera.width}x{camera.height} != depth {W}x{H}"
+        )
+
+    xs = np.arange(0, W, stride, dtype=np.float64)
+    ys = np.arange(0, H, stride, dtype=np.float64)
+    uu, vv = np.meshgrid(xs, ys)
+    uv = np.stack([uu.ravel(), vv.ravel()], axis=1)
+    z = depth_hw[vv.astype(int), uu.astype(int)].ravel()
+
+    xy = camera.cam_from_img(uv)
+    x_cam = xy[:, 0] * z
+    y_cam = xy[:, 1] * z
+    z_cam = z
+    pts_cam = np.stack([x_cam, y_cam, z_cam], axis=1)
+
+    valid = np.isfinite(z) & (z > 0)
+    pts_cam = pts_cam[valid]
+    if pts_cam.shape[0] == 0:
+        return np.zeros((0, 3), dtype=np.float64)
+
+    pts_world = world_from_cam * pts_cam
+    return np.asarray(pts_world, dtype=np.float64)
+
+
+def _write_ply_ascii(path, points_xyz):
+    """Minimal ASCII PLY writer (x y z per vertex)."""
+    n = points_xyz.shape[0]
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("ply\nformat ascii 1.0\n")
+        f.write(f"element vertex {n}\n")
+        f.write("property float x\nproperty float y\nproperty float z\n")
+        f.write("end_header\n")
+        for i in range(n):
+            x, y, z = points_xyz[i]
+            f.write(f"{x} {y} {z}\n")
+
+
+def _safe_stem_from_image_name(name):
+    base = os.path.splitext(os.path.basename(name))[0]
+    out = "".join(c if c.isalnum() or c in "-_" else "_" for c in base)
+    return out or "frame"
+
+
+def save_colmap_depth_point_clouds(
+    depth, reconstruction, frame_matches, output_dir, pts_stride=1,
+):
+    """Save one PLY per matched frame under output_dir/pts/."""
+    pts_dir = os.path.join(output_dir, "pts")
+    os.makedirs(pts_dir, exist_ok=True)
+
+    saved = []
+    for t, image in frame_matches:
+        cam = _camera_for_image(reconstruction, image)
+        depth_hw = _depth_hw_z(depth[t])
+        orig_h, orig_w = depth_hw.shape
+        cam.rescale(orig_w, orig_h)
+
+        world_from_cam = image.cam_from_world().inverse()
+        pts = depth_to_world_points(depth_hw, cam, world_from_cam, stride=pts_stride)
+        stem = _safe_stem_from_image_name(image.name)
+        out_path = os.path.join(pts_dir, f"{t:06d}_{stem}.ply")
+        _write_ply_ascii(out_path, pts)
+        saved.append(out_path)
+        print(f"Wrote {out_path} ({pts.shape[0]} points)")
+
+    return saved
+
+
+def run_colmap_point_export(args, depth, frame_keys):
+    if not args.colmap:
+        return
+    try:
+        import pycolmap
+    except ImportError as e:
+        raise ImportError(
+            "pycolmap is required for --colmap. Install with: pip install pycolmap"
+        ) from e
+
+    sparse_path = _resolve_colmap_sparse_path(args.colmap)
+    reconstruction = pycolmap.Reconstruction(sparse_path)
+    T = depth.shape[0]
+    matches = match_colmap_images(reconstruction, T, frame_keys)
+    if not matches:
+        print("No input frames matched COLMAP images; skipping pts/ export.")
+        return
+
+    print(
+        f"COLMAP: {len(matches)} / {T} frames matched "
+        f"(model from {sparse_path})."
+    )
+    save_colmap_depth_point_clouds(
+        depth,
+        reconstruction,
+        matches,
+        args.output_dir,
+        pts_stride=args.pts_stride,
+    )
 
 
 def pad_time_mod4(video_tensor):
@@ -296,11 +494,11 @@ def load_model(ckpt_dir, yaml_args):
 def load_video_data(args):
     """Loads and resizes the input video or an image sequence from a folder."""
     if os.path.isdir(args.input_video):
-        input_tensor, origin_fps = read_image_sequence(
+        input_tensor, origin_fps, frame_keys = read_image_sequence(
             args.input_video, args.sequence_fps)
         print(f"Loaded {input_tensor.shape[1]} frames from image sequence")
     else:
-        input_tensor, origin_fps = read_video(args.input_video)
+        input_tensor, origin_fps, frame_keys = read_video(args.input_video)
     print("Original shape:", input_tensor.shape)
 
     input_tensor, orig_size = resize_for_training_scale(
@@ -308,7 +506,7 @@ def load_video_data(args):
     print("Resized shape:", input_tensor.shape)
     print(f"input range {input_tensor.min()} - {input_tensor.max()}")
 
-    return input_tensor, orig_size, origin_fps
+    return input_tensor, orig_size, origin_fps, frame_keys
 
 
 def predict_depth(model, input_tensor, orig_size, args):
@@ -369,6 +567,19 @@ def parse_args():
     parser.add_argument('--width', type=int, default=640)
     parser.add_argument("--overlap", type=int, default=9)
     parser.add_argument('--grayscale', action='store_true')
+    parser.add_argument(
+        "--colmap",
+        type=str,
+        default=None,
+        help="COLMAP reconstruction root (expects sparse model at this path or sparse/0). "
+        "Exports one PLY point cloud per matched frame under output_dir/pts/.",
+    )
+    parser.add_argument(
+        "--pts_stride",
+        type=int,
+        default=1,
+        help="Pixel stride when sampling depth for COLMAP point clouds (larger = fewer points).",
+    )
     return parser.parse_args()
 
 
@@ -383,13 +594,16 @@ def main():
     model = load_model(args.ckpt, yaml_args)
 
     # 2. Load Video
-    input_tensor, orig_size, origin_fps = load_video_data(args)
+    input_tensor, orig_size, origin_fps, frame_keys = load_video_data(args)
 
     # 3. Predict Depth
     depth = predict_depth(model, input_tensor, orig_size, args)
 
     # 4. Save Results
     save_results(depth, origin_fps, args)
+
+    # 5. Optional COLMAP-registered world point clouds
+    run_colmap_point_export(args, depth, frame_keys)
 
     print("Inference completed successfully!")
 
